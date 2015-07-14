@@ -25,11 +25,6 @@ import socket
 import sys
 from threading import Thread
 import time
-from zktraffic.base.network import BadPacket
-from zktraffic.base.util import read_long, read_number, read_string
-import zktraffic.fle.message
-import zktraffic.zab.quorum_packet
-from zktraffic import __version__
 from twitter.common import app
 from twitter.common.log.options import LogOptions
 from scapy.sendrecv import sniff
@@ -39,7 +34,11 @@ if os.getenv("ZKTRAFFIC_SOURCE") is not None:
     sys.path.insert(0, "..")
     sys.path.insert(0, ".")
 
-
+from zktraffic.base.network import BadPacket
+from zktraffic.base.util import read_long, read_number, read_string
+import zktraffic.fle.message
+import zktraffic.zab.quorum_packet
+from zktraffic import __version__
 
 class OmniSniffer(Thread):
     TCP_RST = 0x04
