@@ -1,0 +1,178 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+#
+# ==================================================================================================
+# Copyright 2015 Twitter, Inc.
+# --------------------------------------------------------------------------------------------------
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this work except in compliance with the License.
+# You may obtain a copy of the License in the LICENSE file, or at:
+#
+#  http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==================================================================================================
+
+import os
+import signal
+import struct
+import hexdump
+import socket
+import sys
+from threading import Thread
+from zktraffic.base.network import BadPacket
+from zktraffic.base.util import read_long, read_number, read_string
+from zktraffic.fle.message import Initial
+from zktraffic import __version__
+from twitter.common import app
+from twitter.common.log.options import LogOptions
+from scapy.sendrecv import sniff
+import scapy.all
+
+if os.getenv("ZKTRAFFIC_SOURCE") is not None:
+  sys.path.insert(0,  "..")
+  sys.path.insert(0, ".")
+
+
+
+class OmniSniffer(Thread):
+  def __init__(self, pfilter="tcp", dump_bad_packet=False, start=True):
+    super(OmniSniffer, self).__init__()
+    self.setDaemon(True)
+
+    self._pfilter = pfilter
+    self._dump_bad_packet = dump_bad_packet
+    self._last_tcp_seq = {}
+
+    if start:  # pragma: no cover
+      self.start()
+
+
+  def run(self, *args, **kwargs):
+    try:
+      sniff_kwargs = {"filter": self._pfilter, "store": 0, "prn": self.handle_packet}
+
+      if "offline" in kwargs:
+        sniff_kwargs["offline"] = kwargs["offline"]
+
+      sniff(**sniff_kwargs)
+    except socket.error as ex:
+      sys.stderr.write("Error: %s, filter: %s\n" % (ex, self._pfilter))
+    finally:
+      if "offline" not in kwargs:
+        os.kill(os.getpid(), signal.SIGINT)
+
+  def handle_packet(self, packet):
+    try:
+      message = self._message_from_packet(packet)
+      print("Message: %s" % message)
+    except (BadPacket, struct.error) as ex:
+      if self._dump_bad_packet:
+        print("got: %s" % str(ex))
+        hexdump.hexdump(packet.load)
+        sys.stdout.flush()
+    except Exception as ex:
+      print("got: %s" % str(ex))
+      hexdump.hexdump(packet.load)
+      sys.stdout.flush()
+
+
+
+  def _message_from_packet(self, packet):
+      """
+
+      :param packet: scapy.packet.Packet
+      :return:
+      """
+      self._precheck_packet(packet)
+
+      self._check_packet_tcp_seq(packet)
+
+      if self._is_packet_fle_initial(packet):
+          print 'FLE'
+          print packet.summary()
+          hexdump.hexdump(str(packet))
+
+
+      raise BadPacket("Unknown packet")
+
+  def _check_packet_tcp_seq(self, packet):
+      """
+      check tcp seq duplicates
+      NOTE: TX/RX duplicate happens on loopback interfaces
+      :param packet:
+      :return:
+      """
+      # we don't have to use dpkt. scapy is enough.
+      src = (packet[scapy.all.IP].src, packet[scapy.all.TCP].sport)
+      dst = (packet[scapy.all.IP].dst, packet[scapy.all.TCP].dport)
+      seq = packet[scapy.all.TCP].seq
+      rst = packet[scapy.all.TCP].flags & 0x04
+      if rst:
+          if (src, dst) in self._last_tcp_seq:
+              del self._last_tcp_seq[(src, dst)]
+      else:
+          if (src, dst) in self._last_tcp_seq:
+              last_seq = self._last_tcp_seq[(src, dst)]
+              if seq <= last_seq:
+                  raise BadPacket("This sequence(%d<=%d) seen before" % (seq, last_seq))
+          self._last_tcp_seq[(src, dst)] = seq
+
+  def _precheck_packet(self, packet):
+      if not isinstance(packet.firstlayer(), scapy.all.Ether):
+          raise BadPacket("First layer:%s" % packet.firstlayer().summary())
+      if not isinstance(packet.lastlayer(), scapy.all.Raw):
+          raise BadPacket("Last layer:%s" % packet.lastlayer().summary())
+      return True
+
+
+  def _is_packet_fle_initial(self, packet):
+      data = str(packet.lastlayer())
+
+      proto, offset = read_long(data, 0)
+      if proto != Initial.PROTO_VER: return False
+
+      server_id, offset = read_long(data, offset)
+      if server_id < 0 or server_id > 256: return False
+
+      election_addr, offset = read_string(data, offset)
+      if election_addr.count(":") != 1: return False
+
+      expected_len = 8 + 8 + 4 + len(election_addr)
+      if len(data) != expected_len: return False
+
+      return True
+
+
+
+
+def setup():
+  LogOptions.set_stderr_log_level('NONE')
+
+  app.add_option('--pfilter', default='tcp', type=str)
+  app.add_option('--dump-bad-packet', default=False, action='store_true')
+  app.add_option('--version', default=False, action='store_true')
+
+
+def main(_, options):
+
+  if options.version:
+    sys.stdout.write("%s\n" % __version__)
+    sys.exit(0)
+
+  sniffer = OmniSniffer(pfilter=options.pfilter, dump_bad_packet=options.dump_bad_packet)
+
+  try:
+    while True:
+        sniffer.join(1)
+  except (KeyboardInterrupt, SystemExit):
+    pass
+
+
+if __name__ == '__main__':
+  setup()
+  app.main()
