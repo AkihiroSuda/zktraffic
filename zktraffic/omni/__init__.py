@@ -1,6 +1,3 @@
-#!/usr/bin/env python
-# -*- coding: utf-8 -*-
-#
 # ==================================================================================================
 # Copyright 2015 Twitter, Inc.
 # --------------------------------------------------------------------------------------------------
@@ -17,17 +14,5 @@
 # limitations under the License.
 # ==================================================================================================
 
-import os
-import sys
 
-if os.getenv("ZKTRAFFIC_SOURCE") is not None:
-  sys.path.insert(0,  "..")
-  sys.path.insert(0, ".")
-
-from zktraffic.cli.omni import main, setup
-
-from twitter.common import app
-
-
-setup()
-app.main()
+# zktraffic
