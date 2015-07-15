@@ -35,7 +35,7 @@ if os.getenv("ZKTRAFFIC_SOURCE") is not None:
   sys.path.insert(0, ".")
 
 from zktraffic.base.network import BadPacket
-from zktraffic.base.util import read_long, read_number, read_string
+from zktraffic.base.util import read_long, read_number, read_string, QuorumConfig
 import zktraffic.fle.message
 import zktraffic.zab.quorum_packet
 from zktraffic import __version__
@@ -51,7 +51,7 @@ class OmniSniffer(Thread):
     self._pfilter = pfilter
     self._dump_bad_packet = dump_bad_packet
     self._last_tcp_seq = {}  # dict[((str,int),(str,int)), int]
-    self._known_conn = {}  # dict[(str,int), str]
+    self._known_servers = {}  # dict[(str,int), str]
 
     if start:  # pragma: no cover
       self.start()
@@ -78,11 +78,11 @@ class OmniSniffer(Thread):
     except (BadPacket, struct.error) as ex:
       if self._dump_bad_packet:
         print("got: %s" % str(ex))
-        hexdump.hexdump(packet.load)
+        hexdump.hexdump(str(packet))
         sys.stdout.flush()
     except Exception as ex:
       print("got: %s" % str(ex))
-      hexdump.hexdump(packet.load)
+      hexdump.hexdump(str(packet))
       sys.stdout.flush()
 
   def _message_from_packet(self, packet):
@@ -91,19 +91,20 @@ class OmniSniffer(Thread):
     :param packet: scapy.packet.Packet
     :return:
     """
-    ip, tcp = packet[scapy.all.IP], packet[scapy.all.TCP]
     self._precheck_packet(packet)
 
     self._check_packet_tcp_seq(packet)
 
     message = self._dispatch_message_from_packet(packet)
     if message:
-      # TODO: parse config and setup self._known_conn if message is FLE.Notificaton
+      if isinstance(message, zktraffic.fle.message.Notification):
+        self._setup_on_fle_notification(packet, message)
       return message
 
     if self._is_packet_fle_initial(packet):
       message = self._fle_zab_message_from_packet(packet, 'fle')
-      self._known_conn[(ip.dst, tcp.dport)] = 'fle'
+      assert isinstance(message, zktraffic.fle.message.Initial)
+      self._setup_on_fle_initial(packet, message)
       return message
 
     raise BadPacket("Unknown packet")
@@ -113,13 +114,13 @@ class OmniSniffer(Thread):
     packet_type = None
     ip, tcp = packet[scapy.all.IP], packet[scapy.all.TCP]
     src, dst = (ip.src, tcp.sport), (ip.dst, tcp.dport)
-    if src in self._known_conn: packet_type = self._known_conn[src]
-    if dst in self._known_conn: packet_type = self._known_conn[dst]
+    if src in self._known_servers: packet_type = self._known_servers[src]
+    if dst in self._known_servers: packet_type = self._known_servers[dst]
     assert packet_type in (None, 'fle', 'zab', 'zk')
     if packet_type in ('fle', 'zab'):
       message = self._fle_zab_message_from_packet(packet, packet_type)
     elif packet_type == 'zk':
-      raise NotImplementedError()
+      message = 'NOT_YET_IMPLEMENTED'
     return message
 
   def _fle_zab_message_from_packet(self, packet, packet_type):
@@ -181,6 +182,51 @@ class OmniSniffer(Thread):
     if len(data) != expected_len: return False
 
     return True
+
+
+  def _setup_on_fle_initial(self, packet, message):
+    """
+    setup self._known_servers
+    :param packet:
+    :param message:
+    """
+    assert isinstance(message, zktraffic.fle.message.Initial)
+    ip, tcp = packet[scapy.all.IP], packet[scapy.all.TCP]
+    self._known_servers[(ip.dst, tcp.dport)] = 'fle'
+
+
+  def _setup_on_fle_notification(self, packet, message):
+    """
+    parse config and setup self._known_servers
+    :param packet:
+    :param message:
+    """
+    assert isinstance(message, zktraffic.fle.message.Notification)
+    ip, tcp = packet[scapy.all.IP], packet[scapy.all.TCP]
+    config = QuorumConfig(message.config)
+    servers = [x for x in config.entries if isinstance(x, QuorumConfig.Server)]
+    for server in servers:
+      zab_fle_ip = server.zab_fle_hostname
+      if zab_fle_ip == 'localhost':
+        assert ip.src == '127.0.0.1', 'foreign localhost(src %s != 127.0.0.1) not supported yet' % ip.src
+        assert ip.dst == '127.0.0.1', 'foreign localhost(dst %s != 127.0.0.1) not supported yet' % ip.dst
+        zab_fle_ip = '127.0.0.1'
+
+      zk_ip = server.zk_hostname
+      if zk_ip in ('localhost', '0.0.0.0'):
+        zk_ip = zab_fle_ip
+
+      try:
+        # check whether correct ip string
+        socket.inet_aton(zab_fle_ip)
+        socket.inet_aton(zk_ip)
+      except Exception as e:
+        raise BadPacket(e)
+
+      # TODO: check overwrites to self._known_servers
+      self._known_servers[(zab_fle_ip, server.zab_port)] = 'zab'
+      self._known_servers[(zab_fle_ip, server.fle_port)] = 'fle'
+      self._known_servers[(zk_ip, server.zk_port)] = 'zk'
 
 
 def setup():
