@@ -22,12 +22,12 @@ import sys
 from twitter.common import app
 from twitter.common.log.options import LogOptions
 
+from zktraffic import __version__
 from zktraffic.cli.printer import Printer as Printer, DefaultPrinter as ZKDefaultPrinter
+from zktraffic.base.sniffer import Sniffer as ZKSniffer, SnifferConfig as ZKSnifferConfig
 from zktraffic.network.sniffer import Sniffer
 import zktraffic.fle.message as FLE
 import zktraffic.zab.quorum_packet as ZAB
-from zktraffic.base.sniffer import Sniffer as ZKSniffer, SnifferConfig as ZKSnifferConfig
-from zktraffic import __version__
 from zktraffic.omni.omni_sniffer import OmniSniffer
 
 

@@ -28,6 +28,18 @@ from .common import get_full_path
 from scapy.utils import rdpcap
 
 class OmniTestCase(unittest.TestCase):
+  PCAP_FILE = 'omni'
+
+  PCAP_MESSAGES = {
+    15: FLE.Initial,
+    25: FLE.Notification,
+    54: ZAB.FollowerInfo,
+    216: ConnectRequest,
+    231: ConnectReply,
+    247: GetChildrenRequest,
+    249: GetChildrenReply
+  }
+
   def get_sniffer(self):
     def fle_sniffer_factory(port):
      return Sniffer('dummy', port, FLE.Message, None, dump_bad_packet=False, start=False)
@@ -53,27 +65,13 @@ class OmniTestCase(unittest.TestCase):
 
   def test_omni(self):
     sniffer = self.get_sniffer()
-    packets = rdpcap(get_full_path('omni'))
+    packets = rdpcap(get_full_path(self.PCAP_FILE))
     for i, packet in enumerate(packets):
-      message = None
       try:
         message = sniffer.message_from_packet(packet)
+        print 'TEST OMNI DUMP MESSAGE(%d): %s' % (i, message)
+        if i in self.PCAP_MESSAGES:
+          self.assertIsInstance(message, self.PCAP_MESSAGES[i])
       except (BadPacket, struct.error) as ex:
         # exception happens on TCP SYN, RST and so on
         pass
-      if message:
-        print 'TEST OMNI DUMP MESSAGE(%d): %s' % (i, message)
-        if i == 15:
-          self.assertIsInstance(message, FLE.Initial)
-        elif i == 25:
-          self.assertIsInstance(message, FLE.Notification)
-        elif i == 54:
-          self.assertIsInstance(message, ZAB.FollowerInfo)
-        elif i == 216:
-          self.assertIsInstance(message, ConnectRequest)
-        elif i == 231:
-          self.assertIsInstance(message, ConnectReply)
-        elif i == 247:
-          self.assertIsInstance(message, GetChildrenRequest)
-        elif i == 249:
-          self.assertIsInstance(message, GetChildrenReply)
