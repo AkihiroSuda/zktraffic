@@ -29,7 +29,7 @@ import traceback
 import hexdump
 import scapy.all
 
-from zktraffic.base.network import BadPacket
+from zktraffic.base.network import BadPacket, SnifferBase
 from zktraffic.base.util import read_long, read_string, QuorumConfig
 from zktraffic.network.sniffer import Sniffer
 import zktraffic.fle.message as FLE
@@ -37,7 +37,7 @@ import zktraffic.zab.quorum_packet as ZAB
 from zktraffic.base.sniffer import Sniffer as ZKSniffer
 
 
-class OmniSniffer(Thread):
+class OmniSniffer(SnifferBase):
   TCP_RST = 0x04
 
   def __init__(self,
@@ -53,7 +53,7 @@ class OmniSniffer(Thread):
     self.fle_sniffer_factory = fle_sniffer_factory
     self.zab_sniffer_factory = zab_sniffer_factory
     self.zk_sniffer_factory = zk_sniffer_factory
-    self._sniffers = {}  # dict[(str,int), object]
+    self._sniffers = {}  # dict[(str,int), SnifferBase]
 
     self._pfilter = pfilter
     self._dump_bad_packet = dump_bad_packet
@@ -78,11 +78,10 @@ class OmniSniffer(Thread):
 
   def handle_packet(self, packet):
     try:
-      message = self._handle_packet(packet)
-      # sniffer = self._find_sniffer_for_packet(packet)
-      # sniffer.handle_message(message)
-      # you can add other handlers for message by overriding this method
-      print('OMNI DUMP MESSAGE %s' % message)
+      message = self.message_from_packet(packet)
+      sniffer = self._find_sniffer_for_packet(packet)
+      sniffer.handle_message(message)
+      self.handle_message(message)
     except (BadPacket, struct.error) as ex:
       if self._dump_bad_packet:
         print("got: %s" % str(ex))
@@ -95,11 +94,15 @@ class OmniSniffer(Thread):
       traceback.print_exc()
       sys.stdout.flush()
 
-  def _handle_packet(self, packet):
+  def handle_message(self, message):
+    # print('OMNI DUMP MESSAGE %s' % message)
+    pass
+
+  def message_from_packet(self, packet):
     """
 
     :param packet: scapy.packet.Packet
-    :return:
+    :return: message
     """
     self._precheck_packet(packet)
 
@@ -112,7 +115,7 @@ class OmniSniffer(Thread):
       return message
 
     if self._is_packet_fle_initial(packet):
-      message = self._fle_zab_message_from_packet(packet, 'fle')
+      message = self._fle_message_from_packet(packet)
       assert isinstance(message, FLE.Initial)
       self._setup_on_fle_initial(packet, message)
       return message
@@ -125,6 +128,7 @@ class OmniSniffer(Thread):
     src, dst = (ip.src, tcp.sport), (ip.dst, tcp.dport)
     if src in self._sniffers: sniffer = self._sniffers[src]
     if dst in self._sniffers: sniffer = self._sniffers[dst]
+    assert sniffer is None or isinstance(sniffer, SnifferBase)
     return sniffer
 
   def _dispatch_message_from_packet(self, packet):
@@ -134,18 +138,16 @@ class OmniSniffer(Thread):
       sniffer_type = self._get_sniffer_type(sniffer)
       assert sniffer_type in ('fle', 'zab', 'zk')
       raw_packet = scapy.all.Raw(str(packet))
-      message = sniffer._message_from_packet(raw_packet)
+      message = sniffer.message_from_packet(raw_packet)
     return message
 
-  def _fle_zab_message_from_packet(self, packet, sniffer_type):
-    assert sniffer_type in ('fle', 'zab')
+  def _fle_message_from_packet(self, packet):
     data = str(packet.lastlayer())
     ip, tcp = packet[scapy.all.IP], packet[scapy.all.TCP]
-    klazz = FLE.Message if sniffer_type == 'fle' else ZAB.QuorumPacket
-    message = klazz.from_payload(data,
-                                 '%s:%d' % (ip.src, tcp.sport),
-                                 '%s:%d' % (ip.dst, tcp.dport),
-                                 time.time())
+    message = FLE.Message.from_payload(data,
+                                       '%s:%d' % (ip.src, tcp.sport),
+                                       '%s:%d' % (ip.dst, tcp.dport),
+                                       time.time())
     return message
 
   def _check_packet_tcp_seq(self, packet):
