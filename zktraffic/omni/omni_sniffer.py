@@ -17,6 +17,8 @@
 # limitations under the License.
 # ==================================================================================================
 
+import dpkt
+import hexdump
 import os
 import signal
 import struct
@@ -25,20 +27,18 @@ import sys
 import time
 import traceback
 
-import hexdump
-import scapy.all
+from scapy.packet import Raw, Packet
+from scapy.sendrecv import sniff
 
-from zktraffic.base.network import BadPacket, SnifferBase
+from zktraffic.base.network import BadPacket, get_ip, get_ip_packet, SnifferBase
+from zktraffic.base.sniffer import Sniffer as ZKSniffer
 from zktraffic.base.util import read_long, read_string, QuorumConfig
 from zktraffic.network.sniffer import Sniffer
 import zktraffic.fle.message as FLE
 import zktraffic.zab.quorum_packet as ZAB
-from zktraffic.base.sniffer import Sniffer as ZKSniffer
 
 
 class OmniSniffer(SnifferBase):
-  TCP_RST = 0x04
-
   def __init__(self,
                fle_sniffer_factory,
                zab_sniffer_factory,
@@ -68,7 +68,7 @@ class OmniSniffer(SnifferBase):
       if "offline" in kwargs:
         sniff_kwargs["offline"] = kwargs["offline"]
 
-      scapy.all.sniff(**sniff_kwargs)
+      sniff(**sniff_kwargs)
     except socket.error as ex:
       sys.stderr.write("Error: %s, filter: %s\n" % (ex, self._pfilter))
     finally:
@@ -84,12 +84,12 @@ class OmniSniffer(SnifferBase):
     except (BadPacket, struct.error) as ex:
       if self._dump_bad_packet:
         print("got: %s" % str(ex))
-        hexdump.hexdump(str(packet))
+        hexdump.hexdump(packet.load)
         traceback.print_exc()
         sys.stdout.flush()
     except Exception as ex:
       print("got: %s" % str(ex))
-      hexdump.hexdump(str(packet))
+      hexdump.hexdump(packet.load)
       traceback.print_exc()
       sys.stdout.flush()
 
@@ -103,9 +103,7 @@ class OmniSniffer(SnifferBase):
     :param packet: scapy.packet.Packet
     :return: message
     """
-    self._precheck_packet(packet)
-
-    self._check_packet_tcp_seq(packet)
+    self._check_packet(packet)
 
     message = self._dispatch_message_from_packet(packet)
     if message:
@@ -121,10 +119,17 @@ class OmniSniffer(SnifferBase):
 
     raise BadPacket("Unknown packet")
 
+  def _parse_packet_src_dst(self, packet):
+    assert isinstance(packet, Packet)
+    ip_p = get_ip_packet(packet.load)
+    src = (get_ip(ip_p, ip_p.src), ip_p.data.sport)
+    dst = (get_ip(ip_p, ip_p.dst), ip_p.data.dport)
+    ret = (src, dst)
+    return ret
+
   def _find_sniffer_for_packet(self, packet):
     sniffer = None
-    ip, tcp = packet[scapy.all.IP], packet[scapy.all.TCP]
-    src, dst = (ip.src, tcp.sport), (ip.dst, tcp.dport)
+    src, dst = self._parse_packet_src_dst(packet)
     if src in self._sniffers: sniffer = self._sniffers[src]
     if dst in self._sniffers: sniffer = self._sniffers[dst]
     assert sniffer is None or isinstance(sniffer, SnifferBase)
@@ -136,33 +141,32 @@ class OmniSniffer(SnifferBase):
     if sniffer:
       sniffer_type = self._get_sniffer_type(sniffer)
       assert sniffer_type in ('fle', 'zab', 'zk')
-      raw_packet = scapy.all.Raw(str(packet))
-      message = sniffer.message_from_packet(raw_packet)
+      message = sniffer.message_from_packet(packet)
     return message
 
   def _fle_message_from_packet(self, packet):
-    data = str(packet.lastlayer())
-    ip, tcp = packet[scapy.all.IP], packet[scapy.all.TCP]
+    src, dst = self._parse_packet_src_dst(packet)
+    data = get_ip_packet(packet.load).data.data
     message = FLE.Message.from_payload(data,
-                                       '%s:%d' % (ip.src, tcp.sport),
-                                       '%s:%d' % (ip.dst, tcp.dport),
+                                       '%s:%d' % (src[0], src[1]),
+                                       '%s:%d' % (dst[0], dst[1]),
                                        time.time())
     return message
 
-  def _check_packet_tcp_seq(self, packet):
+  def _check_packet(self, packet):
     """
     check tcp seq duplicates
     NOTE: TX/RX duplicate happens on loopback interfaces
     :param packet:
     :return: None
     """
-    # we don't have to use dpkt. scapy is enough, right?
-    ip, tcp = packet[scapy.all.IP], packet[scapy.all.TCP]
-    src, dst = (ip.src, tcp.sport), (ip.dst, tcp.dport)
-    if tcp.flags & self.TCP_RST:
+    src, dst = self._parse_packet_src_dst(packet)
+    tcp = get_ip_packet(packet.load).data
+    if tcp.flags & dpkt.tcp.TH_RST:
       if (src, dst) in self._last_tcp_seq:
         del self._last_tcp_seq[(src, dst)]
     else:
+      if not tcp.data: raise BadPacket("no payload")
       if (src, dst) in self._last_tcp_seq:
         last_seq = self._last_tcp_seq[(src, dst)]
         if tcp.seq <= last_seq:
@@ -170,19 +174,8 @@ class OmniSniffer(SnifferBase):
           raise BadPacket("This sequence(%d<=%d) seen before" % (tcp.seq, last_seq))
       self._last_tcp_seq[(src, dst)] = tcp.seq
 
-  def _precheck_packet(self, packet):
-    """
-    precheck packet layers (first=Ether, last=Raw)
-    :param packet:
-    :return: None
-    """
-    if not isinstance(packet.firstlayer(), scapy.all.Ether):
-      raise BadPacket("First layer:%s" % packet.firstlayer().summary())
-    if not isinstance(packet.lastlayer(), scapy.all.Raw):
-      raise BadPacket("Last layer:%s" % packet.lastlayer().summary())
-
   def _is_packet_fle_initial(self, packet):
-    data = str(packet.lastlayer())
+    data = get_ip_packet(packet.load).data.data
 
     proto, offset = read_long(data, 0)
     if proto != FLE.Initial.PROTO_VER: return False
@@ -205,8 +198,8 @@ class OmniSniffer(SnifferBase):
     :param message:
     """
     assert isinstance(message, FLE.Initial)
-    ip, tcp = packet[scapy.all.IP], packet[scapy.all.TCP]
-    self._regist_sniffer(ip.dst, tcp.dport, 'fle')
+    src, dst = self._parse_packet_src_dst(packet)
+    self._regist_sniffer(dst[0], dst[1], 'fle')
 
   def _setup_on_fle_notification(self, packet, message):
     """
@@ -215,14 +208,14 @@ class OmniSniffer(SnifferBase):
     :param message:
     """
     assert isinstance(message, FLE.Notification)
-    ip, tcp = packet[scapy.all.IP], packet[scapy.all.TCP]
+    src, dst = self._parse_packet_src_dst(packet)
     config = QuorumConfig(message.config)
     servers = [x for x in config.entries if isinstance(x, QuorumConfig.Server)]
     for server in servers:
       zab_fle_ip = server.zab_fle_hostname
       if zab_fle_ip == 'localhost':
-        assert ip.src == '127.0.0.1', 'foreign localhost(src %s != 127.0.0.1) not supported yet' % ip.src
-        assert ip.dst == '127.0.0.1', 'foreign localhost(dst %s != 127.0.0.1) not supported yet' % ip.dst
+        assert src[0] == '127.0.0.1', 'foreign localhost(src %s != 127.0.0.1)' % src[0]
+        assert dst[0] == '127.0.0.1', 'foreign localhost(dst %s != 127.0.0.1)' % dst[0]
         zab_fle_ip = '127.0.0.1'
 
       zk_ip = server.zk_hostname
