@@ -22,7 +22,6 @@ import signal
 import struct
 import socket
 import sys
-from threading import Thread
 import time
 import traceback
 

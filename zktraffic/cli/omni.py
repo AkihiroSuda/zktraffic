@@ -34,11 +34,14 @@ from zktraffic.omni.omni_sniffer import OmniSniffer
 def setup():
   LogOptions.set_stderr_log_level('NONE')
 
-  app.add_option('--packet-filter', default='tcp', type=str)
+  app.add_option('--packet-filter', default='tcp', type=str,
+                 help='pcap filter string. e.g. "tcp portrange 11221-32767" for JUnit tests')
   app.add_option('-c', '--colors', default=False, action='store_true')
   app.add_option('--dump-bad-packet', default=False, action='store_true')
   app.add_option('--include-pings', default=False, action='store_true',
                  help='Whether to include ZAB/ZK pings')
+  app.add_option('--offline', default=None, type=str,
+                 help='offline mode with a pcap file')
   app.add_option('--version', default=False, action='store_true')
 
 
@@ -50,7 +53,8 @@ def main(_, options):
   printer = Printer(options.colors,
                     output=sys.stdout,
                     skip_print=None if options.include_pings else lambda msg: isinstance(msg, ZAB.Ping))
-  zk_printer = ZKDefaultPrinter(options.colors, loopback=False)
+  zk_printer = ZKDefaultPrinter(options.colors, loopback=False, output=sys.stdout)
+  zk_printer.start()
 
   def fle_sniffer_factory(port):
     return Sniffer('dummy', port, FLE.Message, printer.add, options.dump_bad_packet, start=False)
@@ -73,16 +77,25 @@ def main(_, options):
       error_to_stderr=True
     )
 
-  # TODO: support pcap files(--offline=file.pcap)
-  sniffer = OmniSniffer(
-    fle_sniffer_factory,
-    zab_sniffer_factory,
-    zk_sniffer_factory,
-    pfilter=options.packet_filter,
-    dump_bad_packet=options.dump_bad_packet)
+  if not options.offline:
+    sniffer = OmniSniffer(
+      fle_sniffer_factory,
+      zab_sniffer_factory,
+      zk_sniffer_factory,
+      pfilter=options.packet_filter,
+      dump_bad_packet=options.dump_bad_packet)
+  else:
+    sniffer = OmniSniffer(
+      fle_sniffer_factory,
+      zab_sniffer_factory,
+      zk_sniffer_factory,
+      pfilter=options.packet_filter,
+      dump_bad_packet=options.dump_bad_packet,
+      start=False)
+    sniffer.run(offline=options.offline)
 
   try:
-    while printer.isAlive() or zk_printer.isAlive():
+    while (printer.isAlive() or zk_printer.isAlive()) and not options.offline:
       sniffer.join(1)
   except (KeyboardInterrupt, SystemExit):
     pass
