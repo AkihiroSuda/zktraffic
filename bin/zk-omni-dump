@@ -25,6 +25,7 @@ import socket
 import sys
 from threading import Thread
 import time
+import traceback
 from twitter.common import app
 from twitter.common.log.options import LogOptions
 from scapy.sendrecv import sniff
@@ -36,22 +37,35 @@ if os.getenv("ZKTRAFFIC_SOURCE") is not None:
 
 from zktraffic.base.network import BadPacket
 from zktraffic.base.util import read_long, read_number, read_string, QuorumConfig
-import zktraffic.fle.message
-import zktraffic.zab.quorum_packet
+from zktraffic.cli.printer import Printer as Printer, DefaultPrinter as ZKDefaultPrinter
+from zktraffic.network.sniffer import Sniffer
+import zktraffic.fle.message as FLE
+import zktraffic.zab.quorum_packet as ZAB
+from zktraffic.base.sniffer import Sniffer as ZKSniffer, SnifferConfig as ZKSnifferConfig
 from zktraffic import __version__
 
 
 class OmniSniffer(Thread):
   TCP_RST = 0x04
 
-  def __init__(self, pfilter="tcp", dump_bad_packet=False, start=True):
+  def __init__(self,
+               fle_sniffer_factory,
+               zab_sniffer_factory,
+               zk_sniffer_factory,
+               pfilter="tcp",
+               dump_bad_packet=False,
+               start=True):
     super(OmniSniffer, self).__init__()
     self.setDaemon(True)
+
+    self.fle_sniffer_factory = fle_sniffer_factory
+    self.zab_sniffer_factory = zab_sniffer_factory
+    self.zk_sniffer_factory = zk_sniffer_factory
+    self._sniffers = {}  # dict[(str,int), object]
 
     self._pfilter = pfilter
     self._dump_bad_packet = dump_bad_packet
     self._last_tcp_seq = {}  # dict[((str,int),(str,int)), int]
-    self._known_servers = {}  # dict[(str,int), str]
 
     if start:  # pragma: no cover
       self.start()
@@ -73,16 +87,19 @@ class OmniSniffer(Thread):
   def handle_packet(self, packet):
     try:
       message = self._message_from_packet(packet)
-      # TODO: support handlers (i.e. Printers)
-      print("Message: %s" % message)
+      sniffer = self._find_sniffer_for_packet(packet)
+      sniffer.handle_packet(packet)
+      print("OMNI DUMP Message: %s" % message)
     except (BadPacket, struct.error) as ex:
       if self._dump_bad_packet:
         print("got: %s" % str(ex))
         hexdump.hexdump(str(packet))
+        traceback.print_exc()
         sys.stdout.flush()
     except Exception as ex:
       print("got: %s" % str(ex))
       hexdump.hexdump(str(packet))
+      traceback.print_exc()
       sys.stdout.flush()
 
   def _message_from_packet(self, packet):
@@ -97,37 +114,43 @@ class OmniSniffer(Thread):
 
     message = self._dispatch_message_from_packet(packet)
     if message:
-      if isinstance(message, zktraffic.fle.message.Notification):
+      if isinstance(message, FLE.Notification):
         self._setup_on_fle_notification(packet, message)
       return message
 
     if self._is_packet_fle_initial(packet):
       message = self._fle_zab_message_from_packet(packet, 'fle')
-      assert isinstance(message, zktraffic.fle.message.Initial)
+      assert isinstance(message, FLE.Initial)
       self._setup_on_fle_initial(packet, message)
       return message
 
     raise BadPacket("Unknown packet")
 
-  def _dispatch_message_from_packet(self, packet):
-    message = None
-    packet_type = None
+  def _find_sniffer_for_packet(self, packet):
+    sniffer = None
     ip, tcp = packet[scapy.all.IP], packet[scapy.all.TCP]
     src, dst = (ip.src, tcp.sport), (ip.dst, tcp.dport)
-    if src in self._known_servers: packet_type = self._known_servers[src]
-    if dst in self._known_servers: packet_type = self._known_servers[dst]
-    assert packet_type in (None, 'fle', 'zab', 'zk')
-    if packet_type in ('fle', 'zab'):
-      message = self._fle_zab_message_from_packet(packet, packet_type)
-    elif packet_type == 'zk':
-      message = 'NOT_YET_IMPLEMENTED'
+    if src in self._sniffers: sniffer = self._sniffers[src]
+    if dst in self._sniffers: sniffer = self._sniffers[dst]
+    return sniffer
+
+  def _dispatch_message_from_packet(self, packet):
+    message = None
+    sniffer = self._find_sniffer_for_packet(packet)
+    if sniffer:
+      sniffer_type = self._get_sniffer_type(sniffer)
+      assert sniffer_type in ('fle', 'zab', 'zk')
+      print'===CALL SNIFFER %s(%s)===' % (sniffer_type, sniffer)
+      raw_packet = scapy.all.Raw(str(packet))
+      message = sniffer._message_from_packet(raw_packet)
+      print'===message=%s===' % (message)
     return message
 
-  def _fle_zab_message_from_packet(self, packet, packet_type):
-    assert packet_type in ('fle', 'zab')
+  def _fle_zab_message_from_packet(self, packet, sniffer_type):
+    assert sniffer_type in ('fle', 'zab')
     data = str(packet.lastlayer())
     ip, tcp = packet[scapy.all.IP], packet[scapy.all.TCP]
-    klazz = zktraffic.fle.message.Message if packet_type == 'fle' else zktraffic.zab.quorum_packet.QuorumPacket
+    klazz = FLE.Message if sniffer_type == 'fle' else ZAB.QuorumPacket
     message = klazz.from_payload(data,
                                  '%s:%d' % (ip.src, tcp.sport),
                                  '%s:%d' % (ip.dst, tcp.dport),
@@ -170,7 +193,7 @@ class OmniSniffer(Thread):
     data = str(packet.lastlayer())
 
     proto, offset = read_long(data, 0)
-    if proto != zktraffic.fle.message.Initial.PROTO_VER: return False
+    if proto != FLE.Initial.PROTO_VER: return False
 
     server_id, offset = read_long(data, offset)
     if server_id < 0 or server_id > 256: return False
@@ -183,25 +206,23 @@ class OmniSniffer(Thread):
 
     return True
 
-
   def _setup_on_fle_initial(self, packet, message):
     """
-    setup self._known_servers
+    setup self._sniffers on FLE.Initial
     :param packet:
     :param message:
     """
-    assert isinstance(message, zktraffic.fle.message.Initial)
+    assert isinstance(message, FLE.Initial)
     ip, tcp = packet[scapy.all.IP], packet[scapy.all.TCP]
-    self._known_servers[(ip.dst, tcp.dport)] = 'fle'
-
+    self._regist_sniffer(ip.dst, tcp.dport, 'fle')
 
   def _setup_on_fle_notification(self, packet, message):
     """
-    parse config and setup self._known_servers
+    parse config and setup self._sniffers on FLE.Notification
     :param packet:
     :param message:
     """
-    assert isinstance(message, zktraffic.fle.message.Notification)
+    assert isinstance(message, FLE.Notification)
     ip, tcp = packet[scapy.all.IP], packet[scapy.all.TCP]
     config = QuorumConfig(message.config)
     servers = [x for x in config.entries if isinstance(x, QuorumConfig.Server)]
@@ -223,17 +244,51 @@ class OmniSniffer(Thread):
       except Exception as e:
         raise BadPacket(e)
 
-      # TODO: check overwrites to self._known_servers
-      self._known_servers[(zab_fle_ip, server.zab_port)] = 'zab'
-      self._known_servers[(zab_fle_ip, server.fle_port)] = 'fle'
-      self._known_servers[(zk_ip, server.zk_port)] = 'zk'
+      self._regist_sniffer(zab_fle_ip, server.fle_port, 'fle')
+      self._regist_sniffer(zab_fle_ip, server.zab_port, 'zab')
+      self._regist_sniffer(zk_ip, server.zk_port, 'zk')
+
+  def _regist_sniffer(self, ip, port, type):
+    print 'REGISTERING SNIFFER %s (%s,%d)' % (type, ip, port)
+    if (ip, port) in self._sniffers:
+      current_sniffer = self._sniffers[(ip, port)]
+      current_sniffer_type = self._get_sniffer_type(current_sniffer)
+      assert type == current_sniffer_type, 'Conflict %s vs %s' % (type, current_sniffer_type)
+      return
+
+    if type == 'fle':
+      sniffer = self.fle_sniffer_factory(port)
+    elif type == 'zab':
+      sniffer = self.zab_sniffer_factory(port)
+    elif type == 'zk':
+      sniffer = self.zk_sniffer_factory(port)
+    else:
+      raise ValueError('Unknown sniffer type %s' % type)
+    print 'REGISTERED SNIFFER %s(%s) (%s,%d)' % (sniffer, type, ip, port)
+    self._sniffers[(ip, port)] = sniffer
+
+  def _get_sniffer_type(self, sniffer):
+    if isinstance(sniffer, Sniffer):
+      if sniffer._msg_cls == FLE.Message:
+        return 'fle'
+      elif sniffer._msg_cls == ZAB.QuorumPacket:
+        return 'zab'
+      else:
+        raise ValueError('Unknown sniffer msg cls %s' % sniffer._msg_cls)
+    else:
+      if isinstance(sniffer, ZKSniffer):
+        return 'zk'
+    raise ValueError('Unknown sniffer %s' % sniffer)
 
 
 def setup():
   LogOptions.set_stderr_log_level('NONE')
 
   app.add_option('--packet-filter', default='tcp', type=str)
+  app.add_option('-c', '--colors', default=False, action='store_true')
   app.add_option('--dump-bad-packet', default=False, action='store_true')
+  app.add_option('--include-pings', default=False, action='store_true',
+                 help='Whether to include ZAB/ZK pings')
   app.add_option('--version', default=False, action='store_true')
 
 
@@ -242,11 +297,39 @@ def main(_, options):
     sys.stdout.write("%s\n" % __version__)
     sys.exit(0)
 
-  # TODO: support pcap files
-  sniffer = OmniSniffer(pfilter=options.packet_filter, dump_bad_packet=options.dump_bad_packet)
+  skip = None if options.include_pings else lambda msg: isinstance(msg, ZAB.Ping)
+  printer = Printer(options.colors, output=sys.stdout, skip_print=skip)
+  zk_printer = ZKDefaultPrinter(options.colors, loopback=False)
+
+  def fle_sniffer_factory(port):
+    return Sniffer('dummy', port, FLE.Message, printer.add, options.dump_bad_packet, start=False)
+
+  def zab_sniffer_factory(port):
+    return Sniffer('dummy', port, ZAB.QuorumPacket, printer.add, options.dump_bad_packet, start=False)
+
+  def zk_sniffer_factory(port):
+    config = ZKSnifferConfig('dummy')
+    config.track_replies = True
+    config.zookeeper_port = port
+    config.client_port = 0
+    return ZKSniffer(
+      config,
+      zk_printer.request_handler,
+      zk_printer.reply_handler,
+      zk_printer.event_handler,
+      error_to_stderr=True
+    )
+
+  # TODO: support pcap files(--offline=file.pcap)
+  sniffer = OmniSniffer(
+    fle_sniffer_factory,
+    zab_sniffer_factory,
+    zk_sniffer_factory,
+    pfilter=options.packet_filter,
+    dump_bad_packet=options.dump_bad_packet)
 
   try:
-    while True:
+    while printer.isAlive() or zk_printer.isAlive():
       sniffer.join(1)
   except (KeyboardInterrupt, SystemExit):
     pass
