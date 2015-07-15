@@ -31,8 +31,8 @@ from scapy.sendrecv import sniff
 import scapy.all
 
 if os.getenv("ZKTRAFFIC_SOURCE") is not None:
-    sys.path.insert(0, "..")
-    sys.path.insert(0, ".")
+  sys.path.insert(0, "..")
+  sys.path.insert(0, ".")
 
 from zktraffic.base.network import BadPacket
 from zktraffic.base.util import read_long, read_number, read_string
@@ -40,173 +40,172 @@ import zktraffic.fle.message
 import zktraffic.zab.quorum_packet
 from zktraffic import __version__
 
+
 class OmniSniffer(Thread):
-    TCP_RST = 0x04
+  TCP_RST = 0x04
 
-    def __init__(self, pfilter="tcp", dump_bad_packet=False, start=True):
-        super(OmniSniffer, self).__init__()
-        self.setDaemon(True)
+  def __init__(self, pfilter="tcp", dump_bad_packet=False, start=True):
+    super(OmniSniffer, self).__init__()
+    self.setDaemon(True)
 
-        self._pfilter = pfilter
-        self._dump_bad_packet = dump_bad_packet
-        self._last_tcp_seq = {}  # dict[((str,int),(str,int)), int]
-        self._known_conn = {}  # dict[(str,int), str]
+    self._pfilter = pfilter
+    self._dump_bad_packet = dump_bad_packet
+    self._last_tcp_seq = {}  # dict[((str,int),(str,int)), int]
+    self._known_conn = {}  # dict[(str,int), str]
 
-        if start:  # pragma: no cover
-            self.start()
+    if start:  # pragma: no cover
+      self.start()
 
-    def run(self, *args, **kwargs):
-        try:
-            sniff_kwargs = {"filter": self._pfilter, "store": 0, "prn": self.handle_packet}
+  def run(self, *args, **kwargs):
+    try:
+      sniff_kwargs = {"filter": self._pfilter, "store": 0, "prn": self.handle_packet}
 
-            if "offline" in kwargs:
-                sniff_kwargs["offline"] = kwargs["offline"]
+      if "offline" in kwargs:
+        sniff_kwargs["offline"] = kwargs["offline"]
 
-            sniff(**sniff_kwargs)
-        except socket.error as ex:
-            sys.stderr.write("Error: %s, filter: %s\n" % (ex, self._pfilter))
-        finally:
-            if "offline" not in kwargs:
-                os.kill(os.getpid(), signal.SIGINT)
+      sniff(**sniff_kwargs)
+    except socket.error as ex:
+      sys.stderr.write("Error: %s, filter: %s\n" % (ex, self._pfilter))
+    finally:
+      if "offline" not in kwargs:
+        os.kill(os.getpid(), signal.SIGINT)
 
-    def handle_packet(self, packet):
-        try:
-            message = self._message_from_packet(packet)
-            # TODO: support handlers (i.e. Printers)
-            print("Message: %s" % message)
-        except (BadPacket, struct.error) as ex:
-            if self._dump_bad_packet:
-                print("got: %s" % str(ex))
-                hexdump.hexdump(packet.load)
-                sys.stdout.flush()
-        except Exception as ex:
-            print("got: %s" % str(ex))
-            hexdump.hexdump(packet.load)
-            sys.stdout.flush()
+  def handle_packet(self, packet):
+    try:
+      message = self._message_from_packet(packet)
+      # TODO: support handlers (i.e. Printers)
+      print("Message: %s" % message)
+    except (BadPacket, struct.error) as ex:
+      if self._dump_bad_packet:
+        print("got: %s" % str(ex))
+        hexdump.hexdump(packet.load)
+        sys.stdout.flush()
+    except Exception as ex:
+      print("got: %s" % str(ex))
+      hexdump.hexdump(packet.load)
+      sys.stdout.flush()
 
-    def _message_from_packet(self, packet):
-        """
+  def _message_from_packet(self, packet):
+    """
 
-        :param packet: scapy.packet.Packet
-        :return:
-        """
-        ip, tcp = packet[scapy.all.IP], packet[scapy.all.TCP]
-        self._precheck_packet(packet)
+    :param packet: scapy.packet.Packet
+    :return:
+    """
+    ip, tcp = packet[scapy.all.IP], packet[scapy.all.TCP]
+    self._precheck_packet(packet)
 
-        self._check_packet_tcp_seq(packet)
+    self._check_packet_tcp_seq(packet)
 
-        message = self._dispatch_message_from_packet(packet)
-        if message:
-            # TODO: parse config and setup self._known_conn if message is FLE.Notificaton
-            return message
+    message = self._dispatch_message_from_packet(packet)
+    if message:
+      # TODO: parse config and setup self._known_conn if message is FLE.Notificaton
+      return message
 
-        if self._is_packet_fle_initial(packet):
-            message = self._fle_zab_message_from_packet(packet, 'fle')
-            self._known_conn[(ip.dst, tcp.dport)] = 'fle'
-            return message
+    if self._is_packet_fle_initial(packet):
+      message = self._fle_zab_message_from_packet(packet, 'fle')
+      self._known_conn[(ip.dst, tcp.dport)] = 'fle'
+      return message
 
-        raise BadPacket("Unknown packet")
+    raise BadPacket("Unknown packet")
 
+  def _dispatch_message_from_packet(self, packet):
+    message = None
+    packet_type = None
+    ip, tcp = packet[scapy.all.IP], packet[scapy.all.TCP]
+    src, dst = (ip.src, tcp.sport), (ip.dst, tcp.dport)
+    if src in self._known_conn: packet_type = self._known_conn[src]
+    if dst in self._known_conn: packet_type = self._known_conn[dst]
+    assert packet_type in (None, 'fle', 'zab', 'zk')
+    if packet_type in ('fle', 'zab'):
+      message = self._fle_zab_message_from_packet(packet, packet_type)
+    elif packet_type == 'zk':
+      raise NotImplementedError()
+    return message
 
-    def _dispatch_message_from_packet(self, packet):
-        message = None
-        packet_type = None
-        ip, tcp = packet[scapy.all.IP], packet[scapy.all.TCP]
-        src, dst = (ip.src, tcp.sport), (ip.dst, tcp.dport)
-        if src in self._known_conn: packet_type = self._known_conn[src]
-        if dst in self._known_conn: packet_type = self._known_conn[dst]
-        assert packet_type in (None, 'fle', 'zab', 'zk')
-        if packet_type in ('fle', 'zab'):
-            message = self._fle_zab_message_from_packet(packet, packet_type)
-        elif packet_type == 'zk':
-            raise NotImplementedError()
-        return message
+  def _fle_zab_message_from_packet(self, packet, packet_type):
+    assert packet_type in ('fle', 'zab')
+    data = str(packet.lastlayer())
+    ip, tcp = packet[scapy.all.IP], packet[scapy.all.TCP]
+    klazz = zktraffic.fle.message.Message if packet_type == 'fle' else zktraffic.zab.quorum_packet.QuorumPacket
+    message = klazz.from_payload(data,
+                                 '%s:%d' % (ip.src, tcp.sport),
+                                 '%s:%d' % (ip.dst, tcp.dport),
+                                 time.time())
+    return message
 
+  def _check_packet_tcp_seq(self, packet):
+    """
+    check tcp seq duplicates
+    NOTE: TX/RX duplicate happens on loopback interfaces
+    :param packet:
+    :return: None
+    """
+    # we don't have to use dpkt. scapy is enough, right?
+    ip, tcp = packet[scapy.all.IP], packet[scapy.all.TCP]
+    src, dst = (ip.src, tcp.sport), (ip.dst, tcp.dport)
+    if tcp.flags & self.TCP_RST:
+      if (src, dst) in self._last_tcp_seq:
+        del self._last_tcp_seq[(src, dst)]
+    else:
+      if (src, dst) in self._last_tcp_seq:
+        last_seq = self._last_tcp_seq[(src, dst)]
+        if tcp.seq <= last_seq:
+          # this exception eliminates dups
+          raise BadPacket("This sequence(%d<=%d) seen before" % (tcp.seq, last_seq))
+      self._last_tcp_seq[(src, dst)] = tcp.seq
 
-    def _fle_zab_message_from_packet(self, packet, packet_type):
-        assert packet_type in ('fle', 'zab')
-        data = str(packet.lastlayer())
-        ip, tcp = packet[scapy.all.IP], packet[scapy.all.TCP]
-        klazz = zktraffic.fle.message.Message if packet_type == 'fle' else zktraffic.zab.quorum_packet.QuorumPacket
-        message = klazz.from_payload(data,
-                                     '%s:%d' % (ip.src, tcp.sport),
-                                     '%s:%d' % (ip.dst, tcp.dport),
-                                     time.time())
-        return message
+  def _precheck_packet(self, packet):
+    """
+    precheck packet layers (first=Ether, last=Raw)
+    :param packet:
+    :return: None
+    """
+    if not isinstance(packet.firstlayer(), scapy.all.Ether):
+      raise BadPacket("First layer:%s" % packet.firstlayer().summary())
+    if not isinstance(packet.lastlayer(), scapy.all.Raw):
+      raise BadPacket("Last layer:%s" % packet.lastlayer().summary())
 
-    def _check_packet_tcp_seq(self, packet):
-        """
-        check tcp seq duplicates
-        NOTE: TX/RX duplicate happens on loopback interfaces
-        :param packet:
-        :return: None
-        """
-        # we don't have to use dpkt. scapy is enough, right?
-        ip, tcp = packet[scapy.all.IP], packet[scapy.all.TCP]
-        src, dst = (ip.src, tcp.sport), (ip.dst, tcp.dport)
-        if tcp.flags & self.TCP_RST:
-            if (src, dst) in self._last_tcp_seq:
-                del self._last_tcp_seq[(src, dst)]
-        else:
-            if (src, dst) in self._last_tcp_seq:
-                last_seq = self._last_tcp_seq[(src, dst)]
-                if tcp.seq <= last_seq:
-                    # this exception eliminates dups
-                    raise BadPacket("This sequence(%d<=%d) seen before" % (tcp.seq, last_seq))
-            self._last_tcp_seq[(src, dst)] = tcp.seq
+  def _is_packet_fle_initial(self, packet):
+    data = str(packet.lastlayer())
 
-    def _precheck_packet(self, packet):
-        """
-        precheck packet layers (first=Ether, last=Raw)
-        :param packet:
-        :return: None
-        """
-        if not isinstance(packet.firstlayer(), scapy.all.Ether):
-            raise BadPacket("First layer:%s" % packet.firstlayer().summary())
-        if not isinstance(packet.lastlayer(), scapy.all.Raw):
-            raise BadPacket("Last layer:%s" % packet.lastlayer().summary())
+    proto, offset = read_long(data, 0)
+    if proto != zktraffic.fle.message.Initial.PROTO_VER: return False
 
-    def _is_packet_fle_initial(self, packet):
-        data = str(packet.lastlayer())
+    server_id, offset = read_long(data, offset)
+    if server_id < 0 or server_id > 256: return False
 
-        proto, offset = read_long(data, 0)
-        if proto != zktraffic.fle.message.Initial.PROTO_VER: return False
+    election_addr, offset = read_string(data, offset)
+    if election_addr.count(":") != 1: return False
 
-        server_id, offset = read_long(data, offset)
-        if server_id < 0 or server_id > 256: return False
+    expected_len = 8 + 8 + 4 + len(election_addr)
+    if len(data) != expected_len: return False
 
-        election_addr, offset = read_string(data, offset)
-        if election_addr.count(":") != 1: return False
-
-        expected_len = 8 + 8 + 4 + len(election_addr)
-        if len(data) != expected_len: return False
-
-        return True
+    return True
 
 
 def setup():
-    LogOptions.set_stderr_log_level('NONE')
+  LogOptions.set_stderr_log_level('NONE')
 
-    app.add_option('--packet-filter', default='tcp', type=str)
-    app.add_option('--dump-bad-packet', default=False, action='store_true')
-    app.add_option('--version', default=False, action='store_true')
+  app.add_option('--packet-filter', default='tcp', type=str)
+  app.add_option('--dump-bad-packet', default=False, action='store_true')
+  app.add_option('--version', default=False, action='store_true')
 
 
 def main(_, options):
-    if options.version:
-        sys.stdout.write("%s\n" % __version__)
-        sys.exit(0)
+  if options.version:
+    sys.stdout.write("%s\n" % __version__)
+    sys.exit(0)
 
-    # TODO: support pcap files
-    sniffer = OmniSniffer(pfilter=options.packet_filter, dump_bad_packet=options.dump_bad_packet)
+  # TODO: support pcap files
+  sniffer = OmniSniffer(pfilter=options.packet_filter, dump_bad_packet=options.dump_bad_packet)
 
-    try:
-        while True:
-            sniffer.join(1)
-    except (KeyboardInterrupt, SystemExit):
-        pass
+  try:
+    while True:
+      sniffer.join(1)
+  except (KeyboardInterrupt, SystemExit):
+    pass
 
 
 if __name__ == '__main__':
-    setup()
-    app.main()
+  setup()
+  app.main()
